@@ -1,0 +1,2668 @@
+# Tracking of Machine Learning Experiments with MLflow
+
+## Overview
+This project aims to utilize MLflow for tracking machine learning experiments in a distributed microservices system.
+
+In particular, it performs the following:
+- Grid search optimization of various machine learning models with different hyperparameters.
+- Tracking and logging results as metadata.
+- Custom retrieval of information about experiments and runs according to specific needs.
+- Setting a chosen model as a microservice.
+- Training and testing with this model.
+- Simulating production data.
+
+
+The system is composed by 4 fundamental containerized *micro-services*:
+- **MySQL DB**: to *store* and *query* necessary data;
+- **simulator**: to simulate *training*, *testing* and *production* data;
+- **ML model**: a trainable model that can be tested on *data batches*;
+- **tracking**: a service to log, retrieve, and filter metadata and results from experiments, providing flexible access to metrics, parameters, and performance data. 
+
+Each component is identified by a **containerized micro-service**, with its own dependencies and environment, following the typical *application layers* structure (except the *MySQL DB*).
+
+```
+src
+|-- config
+|-- persistence
+    |-- model
+    |-- repository
+|-- service
+|-- utils
+|-- web
+    |-- controller
+```
+
+All *micro-services* are developed using `Python`, basing on [`Flask`](https://flask.palletsprojects.com/en/3.0.x/) framework and the [`Flask RESTful`](https://flask-restful.readthedocs.io/en/latest/) library to provide *REST API*.
+
+```
+from flask import Flask
+from flask_restful import Api, Resource, reqparse
+from flask_mysqldb import MySQL
+```
+
+For each component a `query.py` script (under `src/persistence/repository` folder) is provided, useful to *query* the *MYSQL DB* to *store* and *request* the proper data.
+
+To reproduce the results a `random seed`, equal to [42](https://en.wikipedia.org/wiki/Phrases_from_The_Hitchhiker%27s_Guide_to_the_Galaxy), is set.
+
+Each component can be finally runned with a `Dockerfile` as an indipendent `Docker` *container*.
+
+
+## MySQL DB
+
+We have two MySQL databases:
+
+1. **Dataset Database**: This database stores the datasets required for the ML model to perform prediction tasks. Specifically, it will be used to obtain training and validation data for the optimization process, testing data for model evaluation, and data to simulate production scenarios.
+
+### Datasets table
+
+|**Fields**     |**Type**      |**Attributes**|
+|---------------|--------------|--------------|
+|*dataset_id*   |`int`         |primary key   |
+|*name*         |`varchar(255)`|              |
+
+### Samples table
+
+|**Fields**                    |**Type**      |**Attributes**|
+|------------------------------|--------------|--------------|
+|*sample_id*                   |`int`         |primary key   |
+|*dataset_id*                  |`int`         |foreign key   |
+|*sample_index*                |`int`         |              |
+|*Alcohol*                     |`float`       |              |
+|*Malicacid*                   |`float`       |              |
+|*Ash*                         |`float`       |              |
+|*Alcalinity_of_ash*           |`float`       |              |
+|*Magnesium*                   |`float`       |              |
+|*Total_phenols*               |`float`       |              |
+|*Flavanoids*                  |`float`       |              |
+|*Nonflavanoid_phenols*        |`float`       |              |
+|*Proanthocyanins*             |`float`       |              |
+|*Color_intensity*             |`float`       |              |
+|*Hue*                         |`float`       |              |
+|*0D280_0D315_of_diluted_wines*|`float`       |              |
+|*Proline*                     |`float`       |              |
+
+### Predictions table
+
+|**Fields**        |**Type**|**Attributes**|
+|------------------|--------|--------------|
+|*prediction_id*   |`int`   |primary key   |
+|*sample_index*    |`int`   |foreign key   |
+|*prediction_index*|`int`   |              |
+|*class*           |`int`   |              |
+
+### Targets table
+
+|**Fields**    |**Type**|**Attributes**|
+|--------------|--------|--------------|
+|*target_id*   |`int`   |primary key   |
+|*sample_index*|`int`   |foreign key   |
+|*target_index*|`int`   |              |
+|*class*       |`int`   |              |
+
+2. **MLflow Metadata Database**: This database is automatically managed by MLflow and stores tables for logging experiment metadata, including information about ML models, hyperparameters, metrics, and version history. An explanation of all the tables is provided in M2.1 MLflow Introduction.
+
+### Alembic Version Table
+
+| **Fields**       | **Type**        | **Attributes**    |
+|------------------|-----------------|-------------------|
+| *version_num*    | `varchar(32)`   | primary key       |
+
+
+### Datasets Table
+
+| **Fields**           | **Type**        | **Attributes**    |
+|----------------------|-----------------|-------------------|
+| *dataset_uuid*       | `varchar(36)`   |                   |
+| *experiment_id*      | `int`           | primary key       |
+| *name*               | `varchar(500)`  | primary key       |
+| *digest*             | `varchar(36)`   | primary key       |
+| *dataset_source_type*| `varchar(36)`   |                   |
+| *dataset_source*     | `text`          |                   |
+| *dataset_schema*     | `mediumtext`    |                   |
+| *dataset_profile*    | `mediumtext`    |                   |
+
+
+### Experiment Tags Table
+
+| **Fields**        | **Type**        | **Attributes**    |
+|-------------------|-----------------|-------------------|
+| *key*             | `varchar(250)`  | primary key       |
+| *value*           | `varchar(5000)` |                   |
+| *experiment_id*   | `int`           | primary key       |
+
+
+### Experiments Table
+
+| **Fields**           | **Type**        | **Attributes** |
+|----------------------|-----------------|----------------|
+| *experiment_id*      | `int`           | primary key    |
+| *name*               | `varchar(256)`  |                |
+| *artifact_location*  | `varchar(256)`  |                |
+| *lifecycle_stage*    | `varchar(32)`   |                |
+| *creation_time*      | `bigint`        |                |
+| *last_update_time*   | `bigint`        |                |
+
+
+### Input Tags Table
+
+| **Fields**        | **Type**        | **Attributes**    |
+|-------------------|-----------------|-------------------|
+| *input_uuid*      | `varchar(36)`   | primary key       |
+| *name*            | `varchar(255)`  | primary key       |
+| *value*           | `varchar(500)`  |                   |
+
+
+### Inputs Table
+
+| **Fields**         | **Type**        | **Attributes**    |
+|--------------------|-----------------|-------------------|
+| *input_uuid*       | `varchar(36)`   |                   |
+| *source_type*      | `varchar(36)`   | primary key       |
+| *source_id*        | `varchar(36)`   | primary key       |
+| *destination_type* | `varchar(36)`   | primary key       |
+| *destination_id*   | `varchar(36)`   | primary key       |
+
+
+### Latest Metrics Table
+
+| **Fields**       | **Type**        | **Attributes**    |
+|------------------|-----------------|-------------------|
+| *key*            | `varchar(250)`  | primary key       |
+| *value*          | `double`        |                   |
+| *timestamp*      | `bigint`        |                   |
+| *step*           | `bigint`        |                   |
+| *is_nan*         | `tinyint(1)`    |                   |
+| *run_uuid*       | `varchar(32)`   | primary key       |
+
+
+### Metrics Table
+
+| **Fields**      | **Type**        | **Attributes**   |
+|------------------|-----------------|-------------------|
+| *key*            | `varchar(250)`  | primary key       |
+| *value*          | `double`        | primary key       |
+| *timestamp*      | `bigint`        | primary key       |
+| *run_uuid*       | `varchar(32)`   | primary key       |
+| *step*           | `bigint`        | primary key       |
+| *is_nan*         | `tinyint(1)`    | primary key       |
+
+
+### Model Version Tags Table
+
+| **Fields**        | **Type**        | **Attributes**    |
+|-------------------|-----------------|-------------------|
+| *key*             | `varchar(250)`  | primary key       |
+| *value*           | `varchar(5000)` |                   |
+| *name*            | `varchar(256)`  | primary key       |
+| *version*         | `int`           | primary key       |
+
+
+### Model Versions Table
+
+| **Fields**           | **Type**        | **Attributes**   |
+|----------------------|-----------------|-------------------|
+| *name*               | `varchar(256)`  | primary key       |
+| *version*            | `int`           | primary key       |
+| *creation_time*      | `bigint`        |                   |
+| *last_updated_time*  | `bigint`        |                   |
+| *description*        | `varchar(5000)` |                   |
+| *user_id*            | `varchar(256)`  |                   |
+| *current_stage*      | `varchar(20)`   |                   |
+| *source*             | `varchar(500)`  |                   |
+| *run_id*             | `varchar(32)`   |                   |
+| *status*             | `varchar(20)`   |                   |
+| *status_message*     | `varchar(500)`  |                   |
+| *run_link*           | `varchar(500)`  |                   |
+| *storage_location*    | `varchar(500)`  |                   |
+
+
+### Params Table
+
+| **Fields**      | **Type**        | **Attributes**   |
+|------------------|-----------------|-------------------|
+| *key*            | `varchar(250)`  | primary key       |
+| *value*          | `varchar(8000)` |                   |
+| *run_uuid*       | `varchar(32)`   | primary key       |
+
+
+### Registered Model Aliases Table
+
+| **Fields**         | **Type**        | **Attributes**   |
+|--------------------|-----------------|-------------------|
+| *alias*            | `varchar(256)`  | primary key       |
+| *version*          | `int`           |                   |
+| *name*             | `varchar(256)`  | primary key       |
+
+
+### Registered Model Tags Table
+
+| **Fields**        | **Type**        | **Attributes**   |
+|-------------------|-----------------|-------------------|
+| *key*             | `varchar(250)`  | primary key       |
+| *value*           | `varchar(5000)` |                   |
+| *name*            | `varchar(256)`  | primary key       |
+
+
+### Registered Models Table
+
+| **Fields**           | **Type**        | **Attributes**   |
+|----------------------|-----------------|-------------------|
+| *name*               | `varchar(256)`  | primary key       |
+| *creation_time*      | `bigint`        |                   |
+| *last_updated_time*  | `bigint`        |                   |
+| *description*        | `varchar(5000)` |                   |
+
+
+### Runs Table
+
+| **Fields**           | **Type**        | **Attributes**   |
+|----------------------|-----------------|-------------------|
+| *run_uuid*           | `varchar(32)`   | primary key       |
+| *name*               | `varchar(250)`  |                   |
+| *source_type*        | `varchar(20)`   |                   |
+| *source_name*        | `varchar(500)`  |                   |
+| *entry_point_name*   | `varchar(50)`   |                   |
+| *user_id*            | `varchar(256)`  |                   |
+| *status*             | `varchar(9)`    |                   |
+| *start_time*         | `bigint`        |                   |
+| *end_time*           | `bigint`        |                   |
+| *source_version*     | `varchar(50)`   |                   |
+| *lifecycle_stage*    | `varchar(20)`   |                   |
+| *artifact_uri*       | `varchar(200)`  |                   |
+| *experiment_id*      | `int`           |                   |
+| *deleted_time*       | `bigint`        |                   |
+
+
+### Tags Table
+
+| **Fields**        | **Type**        | **Attributes**   |
+|-------------------|-----------------|-------------------|
+| *key*             | `varchar(250)`  | primary key       |
+| *value*           | `varchar(5000)` |                   |
+| *run_uuid*        | `varchar(32)`   | primary key       |
+
+
+### Trace Info Table
+
+| **Fields**        | **Type**        | **Attributes**   |
+|-------------------|-----------------|-------------------|
+| *request_id*      | `varchar(50)`   | primary key       |
+| *experiment_id*   | `int`           |                   |
+| *timestamp_ms*    | `bigint`        |                   |
+| *execution_time_ms*| `bigint`       |                   |
+| *status*          | `varchar(50)`   |                   |
+
+
+### Trace Request Metadata Table
+
+| **Fields**        | **Type**        | **Attributes**   |
+|-------------------|-----------------|-------------------|
+| *key*             | `varchar(250)`  | primary key       |
+| *value*           | `varchar(8000)` |                   |
+| *request_id*      | `varchar(50)`   | primary key       |
+
+
+### Trace Tags Table
+
+| **Fields**        | **Type**        | **Attributes**   |
+|-------------------|-----------------|-------------------|
+| *key*             | `varchar(250)`  | primary key       |
+| *value*           | `varchar(8000)` |                   |
+| *request_id*      | `varchar(50)`   | primary key       |
+
+
+## Simulator
+
+The focus of this *micro-service* is to extrapolate and simulate:
+- *training* set: 60% of full *dataset*;
+- *testing* set: 20% of full *dataset*;
+- *production* set: 20% of full *dataset*, where a fouling process is applied to simulate data with *missing value* and different *distribution*, causing a performance drop.
+
+Starting from a *dataset*, this component allows to load on the **DB** the chosen set to simulate the different phase of a *ML model* life-cycle.
+
+### Wine Dataset
+
+The chosen *dataset* is the **Wines Dataset**, directly provided by the [`Scikit-Learn`](https://scikit-learn.org/stable/) (`SK-Learn`) library.
+The [*Wine Dataset*](https://scikit-learn.org/stable/modules/generated/sklearn.datasets.load_wine.html) is a classic *toy dataset* that can be used for *multi-class classification* problems.
+
+```
+from sklearn.datasets import load_wine
+```
+
+All the 13 *features* are *real* and *positive*, presenting no *missing value*, for a total of 178 *samples*, with 3 different *classes* to predict.
+
+About *Wine Dataset*:
+> These data are the results of a chemical analysis of wines grown in the same region in Italy but derived from three different cultivars. The analysis determined the quantities of 13 constituents found in each of the three types of wines.
+
+### Code Explanation
+
+#### Simulator Model
+```
+import logging
+
+from sklearn.datasets import load_wine
+
+from persistence.model.i_model import IModel
+
+
+class SimulatorModel(IModel):
+    def __init__(self):
+        self.logger = None
+        self.df = None
+        self.target_name = None
+        self.columns_name = None
+        self.X = None
+        self.y = None
+        self.name = None
+
+        self.initialize()
+
+    def initialize(self):
+        self.logger = logging.getLogger(__name__)
+        data, label = load_wine(return_X_y=True, as_frame=True)
+        df = data.join(label.to_frame())
+        self.target_name = "target"
+        df.columns = [c.replace("/", "__") for c in df.columns]
+        self.columns_name = df.drop([self.target_name], axis=1).columns
+        self.y = df[self.target_name]
+        self.X = df.drop(columns=self.target_name, axis=1)
+        self.name = "DataSimulator"
+
+```
+
+The *Simulator model* allows to:
+- load the *Wine Dataset* in a [`Pandas`](https://pandas.pydata.org/) `Dataframe`, considering the *features* `X` and the *target* `y`;
+- then some operations are applied on the `DataFrame`, to finally set the attribute `X` and `y`.
+
+
+#### Simulator Service
+```
+import logging
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+
+from service.i_service import IService
+from persistence.model.i_model import IModel
+from persistence.repository.impl.query import Query
+
+
+class SimulatorService(IService):
+    def __init__(self, simulator_model: IModel, db=None, seed=42):
+        self.simulator_model = simulator_model
+        self.db = db
+        self.seed = seed
+
+        self.logger = None
+        self.query = None
+        self.X_train = None
+        self.X_test = None
+        self.y_train = None
+        self.y_test = None
+        self.X_test_reference = None
+        self.X_test_current = None
+        self.y_test_reference = None
+        self.y_test_current = None
+
+        self.initialize()
+
+    def initialize(self):
+        self.logger = logging.getLogger(__name__)
+        np.random.seed(self.seed)
+        self.init_query()
+
+    def init_query(self):
+        self.query = Query(self.db)
+        self.query.samples_columns_name = self.simulator_model.columns_name
+
+    def create_tables(self):
+        self.query.create_datasets_table()
+        self.query.create_samples_table()
+        self.query.create_predictions_table()
+        self.query.create_targets_table()
+
+        self.query.describe_table("datasets")
+        self.query.describe_table("samples")
+        self.query.describe_table("targets")
+        self.query.describe_table("predictions")
+
+    def delete_records(self):
+        self.query.delete_values("targets")
+        self.query.delete_values("predictions")
+        self.query.delete_values("samples")
+        self.query.delete_values("datasets")
+
+        self.query.select_value("datasets")
+        self.query.select_value("samples")
+        self.query.select_value("targets")
+        self.query.select_value("predictions")
+
+    def insert_records(self, step):
+        if step == "dataset":
+            self.datasets()
+        elif step == "training":
+            self.training()
+        elif step == "testing":
+            self.testing()
+        elif step == "production":
+            self.production()
+
+    def datasets(self):
+        self.define_datasets()
+
+    def training(self):
+        self.define_training_set()
+        self.load_training_set()
+
+    def testing(self):
+        self.define_testing_set()
+        self.load_testing_set()
+
+    def production(self):
+        self.define_production_set()
+        self.load_production_set()
+
+    def define_datasets(self):
+        records = {"dataset_id": [1, 2, 3], "name": ["training", "testing", "production"]}
+        records = pd.DataFrame(data=records)
+        self.query.insert_dataset_records(records)
+
+        self.query.select_value("datasets")
+
+    def define_training_set(self):
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+            self.simulator_model.X, self.simulator_model.y,
+            train_size=0.6,
+            random_state=self.seed,
+            stratify=self.simulator_model.y
+        )
+
+    def define_testing_set(self):
+        self.X_test_reference, self.X_test_current, self.y_test_reference, self.y_test_current = train_test_split(
+            self.X_test, self.y_test,
+            train_size=0.5,
+            random_state=self.seed,
+            stratify=self.y_test
+        )
+
+    def define_production_set(self):
+        self.X_test_current = self.X_test_current + np.random.normal(0, 0.3)
+        for col in self.X_test_current.columns:
+            self.X_test_current.loc[self.X_test_current.sample(frac=0.03).index, col] = "null"
+
+    def load_training_set(self):
+        records = self.X_train
+        records["dataset_id"] = 1
+        records["sample_index"] = records.index
+        self.query.insert_samples_records(records)
+
+        records = self.y_train.to_frame(name="class")
+        records["sample_index"] = records.index
+        records["target_index"] = records.index
+        self.query.insert_targets_records(records)
+
+        self.query.select_condition_value("samples", 1)
+
+    def load_testing_set(self):
+        records = self.X_test_reference
+        records["dataset_id"] = 2
+        records["sample_index"] = records.index
+        self.query.insert_samples_records(records)
+
+        records = self.y_test_reference.to_frame(name="class")
+        records["sample_index"] = records.index
+        records["target_index"] = records.index
+        self.query.insert_targets_records(records)
+
+        self.query.select_condition_value("samples", 2)
+
+    def load_production_set(self):
+        records = self.X_test_current
+        records["dataset_id"] = 3
+        records["sample_index"] = records.index
+        self.query.insert_samples_records(records)
+
+        records = self.y_test_current.to_frame(name="class")
+        records["sample_index"] = records.index
+        records["target_index"] = records.index
+        self.query.insert_targets_records(records)
+
+        self.query.select_condition_value("samples", 3)
+
+```
+
+The *Simulator service* allows to:
+- create the different *tables* inside the *MySQL DB*, specifically the **datasets**, **samples**, **targets** and **predictions** tables;
+- load immediatly the *dataset records* on starting;
+- waiting for a *request* to insert *samples* and *targets*, therefore the *training*, *testing* or *production* set is defined into the *MySQL DB*.
+
+
+#### Simulator Controller
+```
+import logging
+from flask import Flask
+from flask_restful import Api, Resource, reqparse
+from flask_mysqldb import MySQL
+
+from service.i_service import IService
+from web.controller.i_controller import IController
+
+
+class SimulatorController(IController):
+    def __init__(
+            self,
+            simulator_service: IService,
+            app_host="127.0.0.1", app_port=5000, app_debug=False, base_url="/root", service_url="/simulator",
+            db_host="127.0.0.1", db_port=3306, db_name="", db_user="root", db_password="pass"
+    ):
+        self.simulator_service = simulator_service
+        self.app_host = app_host
+        self.app_port = app_port
+        self.app_debug = app_debug
+        self.base_url = base_url
+        self.service_url = service_url
+        self.db_host = db_host
+        self.db_port = db_port
+        self.db_name = db_name
+        self.db_user = db_user
+        self.db_password = db_password
+
+        self.logger = None
+        self.app = None
+        self.api = None
+        self.parser = None
+        self.db = None
+
+        self.initialize()
+
+    def initialize(self):
+        self.app = Flask(__name__)
+        self.app.config["MYSQL_HOST"] = self.db_host
+        self.app.config["MYSQL_PORT"] = self.db_port
+        self.app.config["MYSQL_DB"] = self.db_name
+        self.app.config["MYSQL_USER"] = self.db_user
+        self.app.config["MYSQL_PASSWORD"] = self.db_password
+        self.app.config["MYSQL_CURSORCLASS"] = "DictCursor"
+        self.app.app_context().push()
+        self.api = Api(self.app)
+        self.parser = reqparse.RequestParser()
+        self.db = MySQL(self.app)
+        self.logger = logging.getLogger("werkzeug")
+        # self.log.setLevel(logging.ERROR)
+
+        self.simulator_service.db = self.db
+        self.simulator_service.init_query()
+
+        self.add_resource()
+        self.set_db()
+
+        '''self.simulator_service.insert_records("training")
+        self.simulator_service.insert_records("testing")
+        self.simulator_service.insert_records("production")'''
+
+    def add_resource(self):
+        self.api.add_resource(
+            Simulator,
+            "".join([self.base_url, self.service_url]),
+            resource_class_kwargs={
+                "parser": self.parser,
+                "db": self.db,
+                "simulator_service": self.simulator_service,
+            }
+        )
+
+    def set_db(self):
+        self.simulator_service.create_tables()
+        self.simulator_service.delete_records()
+
+        self.simulator_service.insert_records("dataset")
+
+    def run(self):
+        self.app.run(host=self.app_host, port=self.app_port, debug=self.app_debug)
+
+
+class Simulator(Resource):
+    def __init__(self, parser, db, simulator_service):
+        self.parser = parser
+        self.db = db
+        self.simulator_service = simulator_service
+
+        self.initialization()
+
+    def initialization(self):
+        self.parser.add_argument("set_name")
+
+    def get(self):
+        payload = {
+            "name": self.simulator_service.simulator_model.name,
+            "message": "Simulator"
+        }
+        return payload
+
+    def post(self):
+        args = self.parser.parse_args()
+        set_name = args["set_name"]
+        self.simulator_service.insert_records(set_name)
+        payload = {
+            "message": "Load {} set".format(set_name)
+        }
+        return payload
+
+```
+
+The *Simulator controller* allows to:
+- build the `Flask` *App* and the *REST API*;
+- instantiate a connection to the *MySQL DB*;
+- mapping the `Resource` to the correct *endpoint*, allowing to define the proper behaviour for every **CRUD** operation;
+- for each `Resource` it is needed to define the arguments to *parse* inside the *request* body.
+
+
+## ML Model
+
+The focus of this *micro-service* is to have an *ML model* capable to be trained and tested over new data.
+
+
+### Model
+
+Initially, no specific ML model is set. However, a model will be configured later through the tracking service via an API. We have selected three potential models that can be implemented:
+
+-  [`RandomForestClassifier`](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.RandomForestClassifier.html)
+-  [`SVC`](https://scikit-learn.org/stable/modules/generated/sklearn.svm.SVC.html)
+-  [`LogisticRegression`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.LogisticRegression.html)
+
+This selection is extendable, allowing for the incorporation of additional models as needed.
+
+
+```
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+```
+
+### Data Pre-Processing
+
+The only precaution taken with respect to the data is to apply a [`Standard Scaler`](https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.StandardScaler.html), fitted on the *training* set, to transform the data before passing to the *ML model*.
+
+```
+from sklearn.preprocessing import StandardScaler
+```
+
+### Code Explanation
+
+#### ML Model Model
+```
+import logging
+from sklearn.tree import DecisionTreeClassifier
+
+from persistence.model.i_model import IModel
+
+
+class MLModel(IModel):
+    def __init__(self, seed=42):
+        self.seed = seed
+
+        self.logger = None
+        self.model = None
+        self.name = None
+
+        self.initialize()
+
+    def initialize(self):
+        self.logger = logging.getLogger(__name__)
+        
+```
+
+
+#### ML Model Service
+```
+import logging
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+from service.i_service import IService
+from persistence.model.i_model import IModel
+from persistence.repository.impl.query import Query
+
+
+class MLService(IService):
+    def __init__(self, ml_model: IModel, db=None, seed=42):
+        self.ml_model = ml_model
+        self.db = db
+        self.seed = seed
+        self.available_models = {
+            "RandomForest": RandomForestClassifier,
+            "SVC": SVC,
+            "LogisticRegression": LogisticRegression
+        }
+
+        self.logger = None
+        self.query = None
+        self.standard_scaler = None
+        self.prediction = None
+
+        self.initialize()
+
+    def initialize(self):
+        self.logger = logging.getLogger(__name__)
+        self.standard_scaler = StandardScaler()
+        self.init_query()
+
+    def init_query(self):
+        self.query = Query(self.db)
+        #self.query.samples_columns_name = self.ml_model.columns_name
+
+    def select_records(self, step):
+        score = 0
+        if step == "training":
+            score = self.training()
+        elif step == "testing":
+            score = self.testing()
+        elif step == "production":
+            score = self.production()
+
+        return score
+
+    def training(self):
+        records = self.query.select_joined_conditioned_value(
+            "samples", "targets", "sample_index", "sample_index", 1
+        )
+
+        X, y, = self.define_set(records)
+        self.pre_processing(X)
+        self.train(X, y)
+        y_pred = self.test(X)
+        score = self.score(y, y_pred)
+        print("score train", score*100)
+
+        self.load_prediction(y_pred)
+
+        return score
+
+    def testing(self):
+        records = self.query.select_joined_conditioned_value(
+            "samples", "targets", "sample_index", "sample_index", 2
+        )
+
+        X, y, = self.define_set(records)
+        self.pre_processing(X, fit=False)
+        y_pred = self.test(X)
+        score = self.score(y, y_pred)
+        print("score test", score*100)
+
+        self.load_prediction(y_pred)
+
+        return score
+
+    def production(self):
+        records = self.query.select_joined_conditioned_value(
+            "samples", "targets", "sample_index", "sample_index", 3
+        )
+
+        X, y, = self.define_set(records)
+        self.pre_processing(X, fit=False)
+        y_pred = self.test(X)
+        score = self.score(y, y_pred)
+        print("score prod", score*100)
+
+        self.load_prediction(y_pred)
+
+        return score
+
+    def define_set(self, records):
+        records = pd.DataFrame(records)
+        self.prediction = records["sample_index"].to_frame(name="sample_index")
+        records = records.drop(columns=[
+            "dataset_id", "sample_id", "target_id",
+            "sample_index", "target_index", "targets.sample_index"
+        ])
+        records.replace({"null", np.nan})
+        X = records.drop(columns=["class"])
+        y = records["class"]
+        return X, y
+
+    def pre_processing(self, X, fit=True):
+        if fit:
+            self.standard_scaler.fit(X)
+        X_np = self.standard_scaler.transform(X)
+        return X_np
+
+    def train(self, X, y):
+        self.ml_model.model.fit(X, y)
+
+    def test(self, X):
+        y = self.ml_model.model.predict(X)
+        return y
+
+    @staticmethod
+    def score(target, prediction):
+        score = accuracy_score(target, prediction)
+        return score
+
+    def load_prediction(self, y_pred):
+        records = self.prediction
+        records["prediction_index"] = records["sample_index"]
+        records["class"] = y_pred
+        self.query.insert_predictions_records(records)
+```
+
+The *ML Model service* allows to:
+- waiting for a *request* to *train* or *test* the *ML model* on the requested set, properly selecting the *samples* and *targets* from the *MySQL DB*;
+- returns the *accuracy score* of the *predictions* made on the requested set, and finally loads them into the *MySQL DB*.
+
+#### ML Model Controller
+```
+import logging
+from flask import Flask
+from flask_restful import Api, Resource, reqparse
+from flask_mysqldb import MySQL
+
+from service.i_service import IService
+from web.controller.i_controller import IController
+
+
+class MLController(IController):
+    def __init__(
+            self,
+            ml_service: IService,
+            app_host="127.0.0.1", app_port=5000, app_debug=False, base_url="/root", service_url="/model",
+            db_host="127.0.0.1", db_port=3306, db_name="", db_user="root", db_password="pass"
+    ):
+        self.ml_service = ml_service
+        self.app_host = app_host
+        self.app_port = app_port
+        self.app_debug = app_debug
+        self.base_url = base_url
+        self.service_url = service_url
+        self.db_host = db_host
+        self.db_port = db_port
+        self.db_name = db_name
+        self.db_user = db_user
+        self.db_password = db_password
+
+        self.logger = None
+        self.app = None
+        self.api = None
+        self.parser = None
+        self.db = None
+
+        self.initialize()
+
+    def initialize(self):
+        self.app = Flask(__name__)
+        self.app.config["MYSQL_HOST"] = self.db_host
+        self.app.config["MYSQL_PORT"] = self.db_port
+        self.app.config["MYSQL_DB"] = self.db_name
+        self.app.config["MYSQL_USER"] = self.db_user
+        self.app.config["MYSQL_PASSWORD"] = self.db_password
+        self.app.config["MYSQL_CURSORCLASS"] = "DictCursor"
+        self.app.app_context().push()
+        self.api = Api(self.app)
+        self.parser = reqparse.RequestParser()
+        self.db = MySQL(self.app)
+        self.logger = logging.getLogger("werkzeug")
+        # self.log.setLevel(logging.ERROR)
+
+        self.ml_service.db = self.db
+        self.ml_service.init_query()
+
+        self.add_resource()
+
+
+    def add_resource(self):
+        self.api.add_resource(
+            Model,
+            "".join([self.base_url, self.service_url]),
+            resource_class_kwargs={
+                "parser": self.parser,
+                "db": self.db,
+                "ml_service": self.ml_service,
+            }
+        )
+
+        self.api.add_resource(
+            SetModel,
+            "".join([self.base_url, self.service_url, "/set_model"]),
+            resource_class_kwargs={
+                "parser": self.parser,
+                "ml_service": self.ml_service,
+            }
+        )
+
+    def run(self):
+        self.app.run(host=self.app_host, port=self.app_port, debug=self.app_debug)
+
+
+class Model(Resource):
+    def __init__(self, parser, db, ml_service: IService):
+        self.parser = parser
+        self.db = db
+        self.ml_service = ml_service
+
+        self.initialization()
+
+    def initialization(self):
+        self.parser.add_argument("dataset")
+
+    def get(self):
+        payload = {
+            "name": self.ml_service.ml_model.name,
+            "message": "ML model"
+        }
+        return payload
+
+    def post(self):
+        args = self.parser.parse_args()
+        dataset = args["dataset"]
+        score = self.ml_service.select_records(dataset)
+        payload = {
+            "message": "Score on {} set: {}%".format(dataset, score*100)
+        }
+        return payload
+```
+
+The *ML Model controller* allows to:
+- build the `Flask` *App* and the *REST API*;
+- instantiate a connection to the *MySQL DB*;
+- mapping the `Resource` to the correct *endpoint*, allowing to define the proper behaviour for every **CRUD** operation;
+- for each `Resource` it is needed to define the arguments to *parse* inside the *request* body.
+
+In addition, the class was created to set a specific model and specify parameters in the body of the request, as shown below:
+```
+class SetModel(Resource):
+    def __init__(self, parser, ml_service: IService):
+        self.parser = parser
+        self.ml_service = ml_service
+
+        self.initialization()
+
+    def initialization(self):
+        self.parser.add_argument("model_name", type=str, location='json', help="Name of ML model")
+        self.parser.add_argument("hyperparameters", type=dict, location='json', help="hyperparameters of model")
+
+    def post(self):
+        args = self.parser.parse_args()
+        model_name = args["model_name"]
+        hyperparameters = args["hyperparameters"]
+
+        try:
+            model = self.ml_service.load_model(model_name, hyperparameters)
+            if model is None:
+                return {
+                    "error": "Model not Found",
+                    "message": "Please Specify 'RandomForest', 'SVC' or 'LogisticRegression'"
+                }, 400
+
+            return {
+                "message": "Model successfully uploaded"
+            }, 200
+
+        except KeyError as ke:
+            missing_param = str(ke).strip("'")
+            return {
+                "error": f"Missing parameter: {missing_param}",
+                "message": f"The parameter '{missing_param}' is required but was not provided"
+            }, 400
+
+        except ValueError as ve:
+            return {
+                "error": str(ve),
+                "message": "Invalid value provided"
+            }, 400
+
+        except Exception as e:
+            return {
+                "error": str(e),
+                "message": "An unexpected error occurred"
+            }, 500
+```
+
+The request will simply contain the name of the model and the hyperparameters to be used.
+
+## Tracking
+
+The *Tracking* microservice was developed for:
+
+1. **Hyperparameter optimization**.
+2. **Cross-validated** model performance evaluation
+3. Creation of Machine learning **Experiments**
+4. **Logging** of Runs Metadata and artifact in MLFlow Database
+5. **Retriving** filtered information from MLFlow Databse
+
+### **MLflow**
+
+MlFlow provides **functions** and **APIs** for easily logging all metadata and artifacts associated with the ML expriments.
+
+Each experiment tracked with **MLflow** is stored in the centralized **MLFlow Database** where can be logging:
+
+- **Experiments Data**
+- **Run Details**
+- **Parameters** such as:
+  - **Best Model Parameters** After grid search of  hyperparameter tuning process.
+  - **Grid Search Parameters** includes configurations like:
+    - `cv`: cross-validation splits
+    - `scoring`: to evaluate each combination of parameters.
+  
+  - **Dataset Parameters**
+    - Number of classes
+    - Number of samples
+    - Number of features
+
+
+- **Metrics** such as:
+  - **Cross-Validation Performance Metrics**:
+    - Accuracy
+    - Precision 
+    - Recall, 
+    - F1 Score
+  
+  - **System Performance Metrics**:
+    - CPU Consumption
+    - Execution Time
+
+  
+
+### Code Explanation
+
+#### Tracking Service
+
+1. **Imports and Dependencies**
+
+```
+import logging
+import psutil
+import time
+from datetime import datetime
+
+import pandas as pd
+import numpy as np
+import mlflow
+import mlflow.sklearn
+
+from mlflow.models import infer_signature
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV, cross_val_predict
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+
+from src.service.i_service import IService
+from src.persistence.model.i_model import IModel
+from src.persistence.repository.impl.query import Query
+
+```
+2. **Class Initialization**
+```
+class TrackingService(IService):
+    def __init__(self, tracking_model: IModel, db=None):
+
+        self.tracking_model = tracking_model
+        self.db = db
+        self.mlflow = None
+        self.logger = None
+        self.query = None
+
+        self.initialize()
+
+    def initialize(self):
+        self.logger = logging.getLogger(__name__)
+        self.init_query()
+        self.mlflow = mlflow
+
+    def init_query(self):
+        self.query = Query(self.db, self.mlflow)
+```
+- Sets up a logger for event tracking.
+- Assigns the mlflow object for tracking experiments.
+- Call to init_query: Invokes the method to configure the query.
+- `self.db = db` Represents an instance of a connection object to a MySQL database.
+
+3. **Model Optimization and Tracking**
+```
+    def track_optimization_info(self, models, hyperparameters, scoring, cv, experiment_name, description, owner):
+
+        training_records = self.query.select_joined_conditioned_value("samples", "targets", "sample_index",
+                                                                      "sample_index", 1)
+        X, y = self.define_set(training_records)
+        results = self.perform_optimization(X, y, models, hyperparameters, scoring, cv)
+        id_runs = self.log_to_mlflow(results, experiment_name, X, y, scoring, cv, hyperparameters, description, owner)
+        return id_runs
+```
+This function performs one of the main tasks. the operations performed are:
+- 3.1 **Selection of trainig data records**
+- 3.2 **Splits data into X (features) and y (target)**
+```
+    def define_set(self, records):
+        records = pd.DataFrame(records)
+        self.prediction = records["sample_index"].to_frame(name="sample_index")
+        records = records.drop(columns=[
+            "dataset_id", "sample_id", "target_id",
+            "sample_index", "target_index", "targets.sample_index"
+        ])
+        records.replace({"null", np.nan})
+        X = records.drop(columns=["class"])
+        y = records["class"]
+        return X, y
+```
+
+- 3.3 **Executes grid search for model tuning and returns metrics and parameters**
+
+```
+    def perform_optimization(self, X, y, models, hyperparameters, scoring, cv):
+        optimized_results = {}
+        for model_name in models:
+            start_time = time.time()
+            cpu_usage_before = psutil.cpu_percent(interval=None)
+
+            model = get_model_by_name(model_name)
+            grid_search = GridSearchCV(estimator=model, param_grid=hyperparameters[model_name],
+                                       scoring=scoring, cv=cv)
+            grid_search.fit(X, y)
+            best_model = grid_search.best_estimator_
+            y_pred = cross_val_predict(best_model, X, y, cv=cv)
+
+            end_time = time.time()
+            cpu_usage_after = psutil.cpu_percent(interval=None)
+            metrics = self.compute_metrics(y, y_pred)
+
+            optimization_time = end_time - start_time
+            cpu_usage_diff = max(0.0, cpu_usage_after - cpu_usage_before)
+
+            optimized_results[model_name] = {
+                "best_model": best_model,
+                "best_params": grid_search.best_params_,
+                "metrics": metrics,
+                "execution_time": optimization_time,
+                "cpu_usage": cpu_usage_diff
+            }
+        return optimized_results
+        
+    def compute_metrics(self, y_true, y_pred):
+    metrics = {'accuracy': accuracy_score(y_true, y_pred), 'f1_score': f1_score(y_true, y_pred, average='weighted'),
+               'precision': precision_score(y_true, y_pred, average='weighted'),
+               'recall': recall_score(y_true, y_pred, average='weighted')}
+    return metrics
+```
+- Sets up a grid search for each model
+- Trains the model using the provided data and hyperparameters.
+- Identifies the best-performing model.
+- Evaluates the best model’s performance through cross-validation predictions.
+- Computes performance metrics.
+
+
+- 3.4 **Logging in MLFlow Database**
+
+```
+    def log_to_mlflow(self, models_results, experiment_name, X_train, y_train, scoring_grid_search, cv, param_grid,
+                      description, owner):
+
+        experiment_id = self.create_mlflow_experiment(experiment_name, tag={"description": description, "owner": owner})
+
+        run_id_dict = {
+            "experiment_id": experiment_id,
+            "run_ids": {}
+        }
+        
+        for model_name, result in models_results.items():
+            best_model = result.get("best_model")
+            best_params = result["best_params"]
+            metrics = result["metrics"]
+
+            run_name = f"{model_name} Grid_Search_Opt and CV_Performance"
+
+            with mlflow.start_run(experiment_id=experiment_id, run_name=run_name) as run:
+                run_id = run.info.run_id
+                mlflow.set_tag("experiment_type", "GridSearch_CrossValidation")
+                mlflow.set_tag("model_type", model_name)
+
+                if best_model and X_train is not None:
+                    signature = infer_signature(X_train, best_model.predict(X_train))
+                    input_example = X_train.iloc[:5]
+
+                    mlflow.sklearn.log_model( sk_model=best_model, artifact_path="model",
+                                              signature=signature, input_example=input_example)
+
+                    model_uri = f"runs:/{run_id}/model"
+                    mlflow.register_model(model_uri, model_name)
+
+                self.logger.info(f"MlFlow Logging for run_id: {run_id}")
+
+                mlflow.log_params({f"model_{k}": v for k, v in best_params.items()})
+                mlflow.log_param("data_samples", X_train.shape[0])
+                mlflow.log_param("data_features", X_train.shape[1])
+                mlflow.log_param("data_classes", len(set(y_train)))
+
+                mlflow.log_params({f"grid_search_{k}": v for k, v in param_grid[model_name].items()})
+                mlflow.log_param("grid_search_scoring", scoring_grid_search)
+                mlflow.log_param("grid_search_cv_folds", cv)
+
+                mlflow.log_metrics({f"model_{k}": v for k, v in metrics.items()})
+                mlflow.log_metric("system_cpu_usage", result['cpu_usage'])
+                mlflow.log_metric("system_execution_time", result['execution_time'])
+
+                run_id_dict["run_ids"][model_name] = run_id
+
+        return run_id_dict
+
+    def create_mlflow_experiment(self, experiment_name, tag):
+        self.logger.info(f"Creating experiment: {experiment_name}")
+
+        try:
+            existing_experiment = self.mlflow.get_experiment_by_name(experiment_name)
+            if existing_experiment is not None:
+                experiment_id = existing_experiment.experiment_id
+                self.logger.info(f"Experiment already exists with ID: {experiment_id}")
+                return experiment_id
+
+            experiment_id = self.mlflow.create_experiment(experiment_name, tags=tag)
+            self.logger.info(f"Experiment created with ID: {experiment_id}")
+            return experiment_id
+
+        except Exception as e:
+            raise RuntimeError(f"Error in Experiment Creation: {e}")
+```
+
+- Create MLflow Experiment ( Check Existing Experiment )
+
+- For Each Best Model start MLflow Run
+  - Sets tags for the experiment type and model type.
+
+- Log Model:
+    - Infers the model's signature and logs the model
+
+- Logs various parameters, including:
+  - Best parameters for the model.
+  - Data shape and classes.
+  - Grid search parameters and scoring method.
+
+- Log Metrics related to: model performance, CPU usage, and execution time.
+
+- Store Run ID in `run_id_dict`
+- Returns the `run_id_dict` containing all run IDs.
+
+
+4. **Information retrieval**
+
+```
+    def get_experiment_info(self, experiment, experiment_runs):
+        experiment_info = {
+            "experiment_info": {
+                "experiment_id": experiment.experiment_id,
+                "experiment_name": experiment.name,
+                "artifact_location": experiment.artifact_location,
+                "lifecycle_stage": experiment.lifecycle_stage,
+                "tags": experiment.tags,
+                "data_creation": datetime.fromtimestamp(experiment.creation_time / 1000).strftime(
+                    '%Y-%m-%d %H:%M:%S') if experiment.creation_time else None,
+                "last_updated": datetime.fromtimestamp(experiment.last_update_time / 1000).strftime(
+                    '%Y-%m-%d %H:%M:%S') if experiment.last_update_time else None,
+            },
+            "experiment_runs": {
+                "number_of_runs": len(experiment_runs),
+                "completed_runs": sum(run["status"] == "FINISHED" for _, run in experiment_runs.iterrows()),
+                "failed_runs": sum(run["status"] == "FAILED" for _, run in experiment_runs.iterrows()),
+                "active_runs": sum(run["status"] == "RUNNING" for _, run in experiment_runs.iterrows()),
+                "stopped_runs": sum(run["status"] == "STOPPED" for _, run in experiment_runs.iterrows()),
+                "first_run_completed": min(
+                    run["start_time"].strftime('%Y-%m-%d %H:%M:%S') for _, run in experiment_runs.iterrows()),
+                "last_run_completed": max(
+                    run["end_time"].strftime('%Y-%m-%d %H:%M:%S') for _, run in experiment_runs.iterrows()),
+            }
+        }
+        return experiment_info
+```
+- Gather Experiment details and statistics
+```
+    def get_best_model(self, experiment_runs, filter_req):
+        if not filter_req or len(filter_req) == 0:
+            raise ValueError("At least one filter (metric) is required.")
+
+        best_metric_value = float('-inf')
+        best_metrics = {}
+        best_run_id = None
+
+        for _, run in experiment_runs.iterrows():
+            run_id = run["run_id"]
+            run = self.mlflow.get_run(run_id)
+            run_metrics = run.data.metrics
+            valid_metrics = {k: v for k, v in run_metrics.items() if k in filter_req}
+
+            for metric_name, metric_value in valid_metrics.items():
+                if metric_value > best_metric_value:
+                    best_metric_value = metric_value
+                    best_run_id = run_id
+                    best_metrics = valid_metrics
+
+        if not best_run_id:
+            return None
+
+        best_run = self.mlflow.get_run(best_run_id)
+        best_run_info = {
+            "run_id": best_run_id,
+            "run_name": best_run.data.tags.get('mlflow.runName', 'Unnamed Run'),
+            "model": best_run.data.tags.get("model_type", "Unknown Model Type"),
+            "metrics": best_metrics
+        }
+
+        return best_run_info
+```
+- Identifies the best model among runs of an experiment based on specified metrics in `filter_req`
+- returning the ID and metrics of the optimal run.
+```
+    def get_statistics(self, experiment_runs, filter_req):
+        durations, accuracies, f1_scores, precisions, recalls = [], [], [], [], []
+
+        for _, run_series in experiment_runs.iterrows():
+            run_id = run_series["run_id"]
+            run = self.mlflow.get_run(run_id)
+            run_metrics = run.data.metrics
+
+            if not filter_req or "all" in filter_req:
+                durations.append(run_metrics.get("system_execution_time", 0))
+                accuracies.append(run_metrics.get("model_accuracy", 0))
+                f1_scores.append(run_metrics.get("model_f1_score", 0))
+                precisions.append(run_metrics.get("model_precision", 0))
+                recalls.append(run_metrics.get("model_recall", 0))
+            else:
+                if "system_execution_time" in filter_req:
+                    durations.append(run_metrics.get("system_execution_time", 0))
+                if "model_accuracy" in filter_req:
+                    accuracies.append(run_metrics.get("model_accuracy", 0))
+                if "model_f1_score" in filter_req:
+                    f1_scores.append(run_metrics.get("model_f1_score", 0))
+                if "model_precision" in filter_req:
+                    precisions.append(run_metrics.get("model_precision", 0))
+                if "model_recall" in filter_req:
+                    recalls.append(run_metrics.get("model_recall", 0))
+
+        stats = {}
+        if durations:
+            stats["duration"] = self.calculate_statistics(durations)
+        if accuracies:
+            stats["accuracy"] = self.calculate_statistics(accuracies)
+        if f1_scores:
+            stats["f1_score"] = self.calculate_statistics(f1_scores)
+        if precisions:
+            stats["precision"] = self.calculate_statistics(precisions)
+        if recalls:
+            stats["recall"] = self.calculate_statistics(recalls)
+
+        return stats
+        
+    def calculate_statistics(self, data):
+            if not data:
+                return {
+                    "mean": 0,
+                    "median": 0,
+                    "std_dev": 0,
+                    "variance": 0,
+                    "min": 0,
+                    "max": 0,
+                    "mode": 0,
+                    "iqr": 0
+                }
+            n = len(data)
+            mean = sum(data) / n
+            sorted_data = sorted(data)
+    
+            median = (sorted_data[n // 2] if n % 2 != 0 else (sorted_data[n // 2 - 1] + sorted_data[n // 2]) / 2)
+            std_dev = (sum((x - mean) ** 2 for x in data) / n) ** 0.5
+            variance = std_dev ** 2
+            min_value = min(data)
+            max_value = max(data)
+            mode = max(set(data), key=data.count)
+    
+            q1 = sorted_data[n // 4]
+            q3 = sorted_data[(3 * n) // 4]
+            iqr = q3 - q1
+    
+            return {
+                "mean": mean,
+                "median": median,
+                "std_dev": std_dev,
+                "variance": variance,
+                "min": min_value,
+                "max": max_value,
+                "mode": mode,
+                "iqr": iqr
+            }
+```
+- Calculate Statistics (mean, median, standard deviation, variance, minimum, maximum, fashion, interquartile range)
+- Returns a dictionary with the calculated statistics for the collected metrics.
+
+```
+    def get_experiment_runs(self, experiment_id):
+        runs_list = []
+
+        experiment_runs = self.mlflow.search_runs([experiment_id])
+
+        for _, run in experiment_runs.iterrows():
+            run_info = {
+                "run_id": run["run_id"],
+                "status": run["status"],
+                "start_time": run["start_time"].strftime('%Y-%m-%d %H:%M:%S'),
+                "end_time": run["end_time"].strftime('%Y-%m-%d %H:%M:%S'),
+                "run_name": run.get("tags.mlflow.runName", "Unnamed Run"),
+                "tags": {
+                    "model_type": run.get("tags.model_type", "Unknown"),
+                    "experiment_type": run.get("tags.experiment_type", "Unknown")
+                }
+            }
+            runs_list.append(run_info)
+
+        return runs_list if runs_list else None
+```
+
+ - It retrieves the runs associated with the provided experiment ID and extracts the key information. 
+
+```
+    def get_run_parameters(self, run, parameter_type):
+        run_params = run.data.params
+        return {
+            key.replace(f"{parameter_type}_", ""): value
+            for key, value in run_params.items()
+            if key.startswith(parameter_type)
+        }
+```
+- Extracts parameters from a specific run.
+- Returns a dictionary with the filtered parameters, removing the prefix specified by `parameter_type`.
+```
+    def get_run_metrics(self, run, metric_type):
+        run_metrics = run.data.metrics
+        return {
+            key.replace(f"{metric_type}_", ""): value
+            for key, value in run_metrics.items()
+            if key.startswith(metric_type)
+        }
+```
+- Extracts metrics from a specific run.
+- Returns a dictionary with the filtered metrics, removing the prefix specified by `metric_type`.
+
+```
+    def track_model_setting(self, run):
+        parameters = self.get_run_parameters(run, "model")
+        hyperparameters = {
+            k: identify_value_type(v)
+            for k, v in parameters.items()
+        }
+        model_name = run.data.tags.get("model_type", "Unknown")
+        return {
+            "model_name": model_name,
+            "hyperparameters": hyperparameters
+        }
+```
+
+```
+
+def identify_value_type(value):
+    if value in ['null', 'None']:
+        return None
+    if isinstance(value, str):
+        if value.isdigit():
+            return int(value)
+        try:
+            float_val = float(value)
+            return float_val
+        except ValueError:
+            return value
+    return value
+
+def get_model_by_name(model_name):
+        models_dict = {
+            "LogisticRegression": LogisticRegression(),
+            "RandomForest": RandomForestClassifier(),
+            "SVC": SVC(),
+        }
+        return models_dict.get(model_name)
+
+```
+Additional functions used to set model in the **ML** microservice
+
+#### Tracking Controller
+```
+import logging
+import json
+import requests
+from flask import Flask, request
+from flask_restful import Api, Resource, reqparse
+from flask_mysqldb import MySQL
+from mlflow import MlflowException
+
+from src.service.i_service import IService
+from src.web.controller.i_controller import IController
+
+
+class TrackingController(IController):
+    def __init__(self,
+                 tracking_service: IService,
+                 app_host="127.0.0.1", app_port=5003, app_debug=False, base_url="/root", service_url="/tracking",
+                 db_dataset_host="127.0.0.1", db_dataset_port=3306, db_dataset_name="", db_dataset_user="root",
+                 db_dataset_password=None,
+                 db_mlflow_host="127.0.0.1", db_mlflow_port=3306, db_mlflow_name="", db_mlflow_user="root",
+                 db_mlflow_password=None,
+                 ml_host="127.0.0.1", ml_port=5001, ml_service_url="/ml"):
+
+        self.tracking_service = tracking_service
+        self.app_host = app_host
+        self.app_port = app_port
+        self.app_debug = app_debug
+        self.base_url = base_url
+        self.service_url = service_url
+
+        self.db_dataset_host = db_dataset_host
+        self.db_dataset_port = db_dataset_port
+        self.db_dataset_user = db_dataset_user
+        self.db_dataset_password = db_dataset_password
+        self.db_dataset_name = db_dataset_name
+
+        self.db_mlflow_host = db_mlflow_host
+        self.db_mlflow_port = db_mlflow_port
+        self.db_mlflow_user = db_mlflow_user
+        self.db_mlflow_password = db_mlflow_password
+        self.db_mlflow_name = db_mlflow_name
+
+        self.ml_host = ml_host
+        self.ml_service_url = ml_service_url
+        self.ml_port = ml_port
+        self.ml_service_uri = None
+
+        self.app_host = app_host
+        self.app_port = app_port
+        self.app_debug = app_debug
+        self.base_url = base_url
+        self.service_url = service_url
+
+        self.logger = None
+        self.app = None
+        self.api = None
+        self.parser = None
+        self.db_dataset = None
+
+        self.initialize()
+
+    def initialize(self):
+        self.app = Flask(__name__)
+
+        self.app.config["MYSQL_HOST"] = self.db_dataset_host
+        self.app.config["MYSQL_PORT"] = self.db_dataset_port
+        self.app.config["MYSQL_DB"] = self.db_dataset_name
+        self.app.config["MYSQL_USER"] = self.db_dataset_user
+        self.app.config["MYSQL_PASSWORD"] = self.db_dataset_password
+        self.app.config["MYSQL_CURSORCLASS"] = "DictCursor"
+
+        self.app.app_context().push()
+        self.api = Api(self.app)
+        self.parser = reqparse.RequestParser()
+
+        self.db_dataset = MySQL(self.app)
+        self.logger = logging.getLogger("werkzeug")
+
+        self.tracking_service.db = self.db_dataset
+
+        mlflow_uri = f"mysql+pymysql://{self.db_mlflow_user}:{self.db_mlflow_password}@{self.db_mlflow_host}:{self.db_mlflow_port}/{self.db_mlflow_name}"
+        self.tracking_service.mlflow.set_tracking_uri(mlflow_uri)
+
+        self.ml_service_uri = f"http://{self.ml_host}:{self.ml_port}{self.base_url}{self.ml_service_url}"
+
+        self.tracking_service.init_query()
+
+        self.add_resource()
+```
+
+- **Imports Libraries:** Imports modules for logging, request handling, MySQL interaction, and MLflow.
+
+- **Initializes Parameters:**
+  - host, ports, database credentials, and ML service settings.
+
+- **Configures Flask App:**
+  - Creates a Flask application and sets up the MySQL database configuration.
+
+- **Initializes API and Parser:**
+  - Sets up a RESTful API and a request parser.
+
+- **Sets Up Database:**
+  - Creates an instance of the MySQL database and links it to the tracking service.
+
+- **Configures MLflow:**
+  - Sets the tracking URI for MLflow using the provided credentials.
+
+- **Sets Up ML Service:**
+  - Constructs the URI to access the machine learning service.
+
+- **Initializes Query in Tracking Service:**
+  - Invokes a method to initialize queries in the tracking service.
+
+- **Adds Resources to the API**
+
+```
+    def add_resource(self):
+        self.api.add_resource(
+            TrackingExperiment,
+            "".join([self.base_url, self.service_url, "/experiments"]),
+            resource_class_kwargs={
+                "parser": self.parser,
+                "tracking_service": self.tracking_service,
+            }
+        )
+
+        self.api.add_resource(
+            TrackingRuns,
+            "".join([self.base_url, self.service_url, "/runs"]),
+            resource_class_kwargs={
+                "parser": self.parser,
+                "tracking_service": self.tracking_service,
+            }
+        )
+
+        self.api.add_resource(
+            Optimization,
+            "".join([self.base_url, self.service_url, "/model_management"]),
+            resource_class_kwargs={
+                "parser": self.parser,
+                "db_dataset": self.db_dataset,
+                "tracking_service": self.tracking_service,
+                "ml_service_uri": self.ml_service_uri
+            }
+        )
+
+    def run(self):
+        self.app.run(host=self.app_host, port=self.app_port, debug=self.app_debug)
+```
+
+  - Adds: **TrackingExperiment Resource, TrackingRuns Resource, Optimization Resource** 
+  - Passes Dependencies:
+
+  - Starts Flask App with `run` Method:
+    - making it accessible on the specified host and port.
+
+```
+class Optimization(Resource):
+    def __init__(self, parser, db_dataset, ml_service_uri, tracking_service: IService):
+
+        self.parser = parser
+        self.db_dataset = db_dataset
+        self.tracking_service = tracking_service
+        self.ml_service_uri = ml_service_uri
+
+        self.initialization()
+
+    def initialization(self):
+
+        self.parser.add_argument("models", type=list, location='json', help="List of models")
+        self.parser.add_argument("hyperparameters", type=dict, location='json', help="Hyperparameters for models")
+        self.parser.add_argument("scoring", type=str, location='json', help="Scoring metric")
+        self.parser.add_argument("cv", type=int, location='json', help="Number of cross-validation folds")
+        self.parser.add_argument("experiment_name", type=str, location='json', help="Name of the experiment")
+        self.parser.add_argument("experiment_description", type=str, location='json',
+                                 help="Description of the experiment")
+        self.parser.add_argument("experiment_owner", type=str, location='json', help="Owner of the experiment")
+
+        self.parser.add_argument("experiment_id", type=str, location='json', help="Experiment Id")
+        self.parser.add_argument("run_id", type=str, location='json', help="Run Id")
+        self.parser.add_argument("request_information", type=str, location='json', help="Type of Request")
+
+    def post(self):
+        try:
+            args = self.parser.parse_args()
+            models = args["models"]
+            hyperparameters = args["hyperparameters"]
+            scoring = args["scoring"]
+            cv = args["cv"]
+            request_info = args.get("request_information")
+
+            experiment_name = args["experiment_name"]
+            experiment_description = args["experiment_description"]
+            experiment_owner = args["experiment_owner"]
+
+            if request_info == "setting":
+                run_id = args.get("run_id")
+
+                if not run_id:
+                    return {
+                        "error": "Run ID is Missing.",
+                        "message": "Please Specify run_id Parameters."
+                    }, 400
+
+                run = self.tracking_service.mlflow.get_run(run_id)
+                if run.info.lifecycle_stage == "deleted":
+                    return {"error": f"Run with ID {run_id} has been deleted."}, 404
+
+                model_info = self.tracking_service.track_model_setting(run)
+
+                response = requests.post(self.ml_service_uri + "/set_model", json.dumps(model_info),
+                                         headers={"Content-Type": "application/json"})
+
+                key, value = next(iter(response.json().items()))
+
+                return {
+                    key: value
+                }, response.status_code
+
+
+            elif request_info == "optimization":
+
+                ids_models = self.tracking_service.track_optimization_info(models, hyperparameters, scoring, cv,
+                                                                           experiment_name, experiment_description,
+                                                                           experiment_owner)
+                return {
+                    "message": "Experiments retrieved successfully",
+                    "data": ids_models
+                }, 201
+
+            else:
+                return {
+                    "error": "",
+                    "message": "Invalid request_info provided"
+                }, 400
+
+        except MlflowException as mlflow_error:
+            return {"error": "MLflow error", "message": str(mlflow_error)}, 500
+
+        except ValueError as ve:
+            return {
+                "error": str(ve),
+                "message": "Invalid value provided"
+            }, 400
+
+        except KeyError as ke:
+            return {
+                "error": f"Missing parameter: {str(ke)}",
+                "message": "Missing parameter"
+            }, 400
+
+        except Exception as e:
+            return {
+                "error": str(e),
+                "message": "An unexpected error occurred"
+            }, 500
+
+```
+The `Optimization` endpoint is designed for model management and optimization, and includes two main operations:
+
+- **setting**: Allows selecting a model via `run_id` and setting it in the machine learning service.
+- **optimization**: Manages optimization information for different models, parameters, and scoring metrics, and records new optimization experiments.
+
+```
+class TrackingExperiment(Resource):
+    def __init__(self, parser, tracking_service):
+        self.parser = parser
+        self.tracking_service = tracking_service
+
+        self.initialization()
+
+    def initialization(self):
+
+        self.parser.add_argument("experiment_id", type=str, location='json', help="Experiment Id")
+        self.parser.add_argument("request_information", type=str, location='json', help="Type of Request")
+        self.parser.add_argument("filter", type=list, location='json', help="Filter for Request Information")
+
+    def get(self):
+
+        try:
+            experiments = self.tracking_service.mlflow.search_experiments()
+            experiments_list = []
+
+            for exp in experiments:
+                runs = self.tracking_service.mlflow.search_runs(experiment_ids=[exp.experiment_id])
+                run_count = len(runs)
+
+                experiments_list.append({
+                    "experiment_id": exp.experiment_id,
+                    "name": exp.name,
+                    "lifecycle_stage": exp.lifecycle_stage,
+                    "run_count": run_count
+                })
+
+            return {
+                "message": "Experiments retrieved successfully",
+                "data": experiments_list
+            }, 200
+
+        except RuntimeError as e:
+            return {
+                "error": str(e),
+                "message": "Failed to retrieve experiments."
+            }, 500
+
+        except MlflowException as mlflow_error:
+            return {"error": "MLflow error", "message": str(mlflow_error)}, 500
+
+        except Exception as e:
+            return {
+                "error": str(e),
+                "message": "An unexpected error occurred while retrieving experiments."
+            }, 500
+
+    def post(self):
+        args = self.parser.parse_args()
+        experiment_id = args.get("experiment_id")
+        request_info = args.get("request_information")
+        filter_req = args.get("filter")
+
+        if not experiment_id or not request_info:
+            return {
+                "error": "Experiment ID and/or Request Info are Missing",
+                "message": "Please Specify experiment_id and request_info Parameters"
+            }, 400
+
+        try:
+
+            experiment = self.tracking_service.mlflow.get_experiment(experiment_id)
+            if not experiment:
+                return {
+                    "error": "Experiment not found",
+                    "message": f"No experiment found with the ID {experiment_id}"
+                }, 400
+
+            experiment_runs = self.tracking_service.mlflow.search_runs([experiment_id])
+            if experiment_runs.empty:
+                return {
+                    "error": "No runs found",
+                    "message": f"No runs associated with the experiment ID {experiment_id}"
+                }, 404
+
+            if request_info == "general":
+                experiment_info = self.tracking_service.get_experiment_info(experiment, experiment_runs)
+
+                return {
+                    "message": "Information Retrieved",
+                    "data": experiment_info
+                }, 200
+
+            elif request_info == "best_model":
+                if not filter_req or len(filter_req) == 0:
+                    return {
+                        "error": "At least one filter (metric) is required.",
+                        "message": "Please specify one of these: 'model_accuracy', 'model_f1_score', 'model_precision',"
+                                   "'model_recall', 'system_cpu_usage', 'system_execution_time'"
+                    }, 400
+
+                best_run_info = self.tracking_service.get_best_model(experiment_runs, filter_req)
+
+                if not best_run_info:
+                    return {
+                        "message": "Best Run Not Found"
+                    }, 404
+
+                return {
+                    "message": "Best model and run retrieved successfully.",
+                    "data": best_run_info
+                }, 200
+
+            elif request_info == "statistics":
+                stats = self.tracking_service.get_statistics(experiment_runs, filter_req)
+                return {"message": "Statistics Retrieved", "data": stats}, 200
+
+            else:
+                return {
+                    "error": "Invalid request_information",
+                    "message": "Please specify 'parameters', 'metrics', or 'best_model'."
+                }, 400
+
+        except MlflowException as mlflow_error:
+            return {"error": "MLflow error", "message": str(mlflow_error)}, 500
+
+        except KeyError as ke:
+            missing_param = str(ke).strip("'")
+            return {
+                "error": f"Missing parameter: {missing_param}",
+                "message": f"The parameter '{missing_param}' is required but was not provided"
+            }, 400
+
+        except ValueError as ve:
+            return {
+                "error": str(ve),
+                "message": "Invalid value provided"
+            }, 400
+
+        except Exception as e:
+            return {
+                "error": str(e),
+                "message": "An unexpected error occurred"
+            }, 500
+
+    def delete(self):
+        try:
+            experiment_id = request.args.get("experiment_id")
+            experiment = self.tracking_service.mlflow.get_experiment(experiment_id)
+            if not experiment:
+                return {"error": f"Experiment with ID {experiment_id} does not exist."}, 404
+
+            self.tracking_service.mlflow.delete_experiment(experiment_id)
+            return {"message": f"Experiment {experiment_id} deleted successfully."}, 200
+
+        except MlflowException as mlflow_error:
+            return {"error": "MLflow error", "message": str(mlflow_error)}, 500
+
+        except Exception as e:
+            return {"error": "An unexpected error occurred.", "message": str(e)}, 500
+```
+
+The `TrackingExperiment` endpoint manages operations on experiments. Provides endpoints for:
+
+- **GET**: Retrieves a list of experiments, including basic information such as `experiment_id`, `name`, and `run_count`.
+- **POST**: Retrieves details of a specific experiment, such as general information, the best model or aggregate statistics, 
+depending on the type of request.
+- **DELETE**: Deletes an experiment specified by `experiment_id`.
+```
+
+class TrackingRuns(Resource):
+    def __init__(self, parser, tracking_service):
+        self.parser = parser
+        self.tracking_service = tracking_service
+        self.initialization()
+
+    def initialization(self):
+        self.parser.add_argument("experiment_id", type=str, location='json', help="Experiment Id")
+        self.parser.add_argument("run_id", type=str, location='json', help="Run Id")
+        self.parser.add_argument("request_information", type=str, location='json', help="Type of Request")
+        self.parser.add_argument("type", type=str, location='json',
+                                 help="Type of Data required: 'data', 'grid_search', 'model' for Parameters and "
+                                      "'system', 'model' for Metrics")
+
+    def get(self):
+        experiment_id = request.args.get("experiment_id")
+
+        if not experiment_id:
+            return {
+                "error": "Experiment ID is Missing",
+                "message": "Please Specify 'experiment_id' Parameter."
+            }, 400
+
+        try:
+            runs_list = self.tracking_service.get_experiment_runs(experiment_id)
+
+            if not runs_list:
+                return {
+                    "error": f"No runs found for experiment ID: {experiment_id}."
+                }, 404
+
+            return {
+                "message": "Experiment Runs Retrieved",
+                "data": runs_list
+            }, 200
+
+        except MlflowException as mlflow_error:
+            return {"error": "MLflow error",
+                    "message": str(mlflow_error)}, 500
+
+        except Exception as e:
+            return {
+                "error": str(e),
+                "message": "An unexpected error occurred"
+            }, 500
+
+    def post(self):
+
+        args = self.parser.parse_args()
+        experiment_id = args.get("experiment_id")
+        run_id = args.get("run_id")
+        request_info = args.get("request_information")
+
+        if not experiment_id or not run_id or not request_info:
+            return {
+                "error": "Experiment ID and/or Request Info are Missing.",
+                "message": "Please Specify experiment_id and request_info Parameters."
+            }, 400
+
+        try:
+            run = self.tracking_service.mlflow.get_run(run_id)
+            if run.info.lifecycle_stage == "deleted":
+                return {"error": f"Run with ID {run_id} has been deleted."}, 404
+
+            if request_info == "parameters":
+                parameter_type = args.get("type")
+                if parameter_type not in ["data", "grid_search", "model"]:
+                    return {
+                        "error": "Invalid value for 'type' Parameter.",
+                        "message": "Please specify 'data', 'grid_search' or 'model'"
+                    }, 400
+
+                filtered_params = self.tracking_service.get_run_parameters(run, parameter_type)
+
+                return {
+                    "message": "Parameters Retrieved",
+                    "data": filtered_params,
+                }, 200
+
+            elif request_info == "metrics":
+                metric_type = args.get("type")
+                if metric_type not in ["system", "model"]:
+                    return {
+                        "error": "Invalid value for 'type' Parameter.",
+                        "message": "Please specify 'system' or 'model'"
+                    }, 400
+
+                filtered_metrics = self.tracking_service.get_run_metrics(run, metric_type)
+
+                return {
+                    "message": "Parameters Retrieved",
+                    "data": filtered_metrics
+                }, 200
+
+            else:
+                return {
+                    "error": "Invalid info type. Please specify 'parameters' or 'metrics'."
+                }, 400
+
+        except KeyError as ke:
+            missing_param = str(ke).strip("'")
+            return {
+                "error": f"Missing parameter: {missing_param}",
+                "message": f"The parameter '{missing_param}' is required but was not provided"
+            }, 400
+
+        except MlflowException as mlflow_error:
+            return {"error": "MLflow error", "message": str(mlflow_error)}, 500
+
+        except ValueError as ve:
+            return {
+                "error": str(ve),
+                "message": "Invalid value provided"
+            }, 400
+
+        except Exception as e:
+            return {
+                "error": str(e),
+                "message": "An unexpected error occurred"
+            }, 500
+
+    def delete(self):
+        run_id = request.args.get("run_id")
+        experiment_id = request.args.get("experiment_id")
+
+        try:
+            experiment = self.tracking_service.mlflow.get_experiment(experiment_id)
+            if not experiment:
+                return {"error": f"Experiment with ID {experiment_id} does not exist."}, 404
+
+            run = self.tracking_service.mlflow.get_run(run_id)
+
+            if run.info.lifecycle_stage == "deleted":
+                return {"error": f"Run with ID {run_id} has already been  deleted."}, 404
+
+            self.tracking_service.mlflow.delete_run(run_id)
+            return {"message": f"Run {run_id} deleted successfully."}, 200
+
+        except MlflowException as mlflow_error:
+            return {"error": "MLflow error", "message": str(mlflow_error)}, 500
+
+        except Exception as e:
+            return {"error": "An unexpected error occurred.", "message": str(e)}, 500
+
+```
+
+`TrackingRuns` Handles operations on executions (`runs`) of experiments. It offers the following methods:
+
+- **GET**: Retrieves all runs for a specific experiment, identified by `experiment_id`.
+- **POST**: Retrieves the parameters and metrics of a specific run (`run_id`) based on the type of request (e.g. `parameters` or `metrics`).
+- **DELETE**: Deletes a specific execution using `run_id`.
+
+### Error Handling
+
+Each resource handles common errors via `try-except` blocks, returning detailed error messages for:
+- Missing required parameters (`KeyError`).
+- Invalid value errors (`ValueError`).
+- Mlflow-specific errors (`MlflowException`).
+- Generic errors (`Exception`).
+
+
+## Run Micro-Services
+
+To run all the [`Docker`](https://www.docker.com/) *container* it is sufficient to run the command `docker-compose up -d`, based on the `docker-compose.yml` file.
+In this way all the *containers* can be runmed simultaneously in background. The *simulator*, *ML model* and *tracking* *micro-services* are mapped on different *port*, rely on the *health check* performed on the *MySQL DB* *container*.
+
+```
+services:
+  db:
+    image: mysql:5.7
+    container_name: ml_model_tracking_db
+    restart: always
+    environment:
+      MYSQL_DATABASE: "wines_database"
+      MYSQL_ROOT_PASSWORD: "ale_sql_pass"
+      MYSQL_PASSWORD: "ale_sql_pass"
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: "/usr/bin/mysql --user=root --password=ale_sql_pass --execute \"SHOW DATABASES;\""
+      interval: 5s
+      timeout: 2s
+      retries: 60
+
+  mlflow_db:
+    image: mysql:5.7
+    container_name: ml_model_tracking_mlflow_db
+    restart: always
+    environment:
+      MYSQL_DATABASE: "mlflow_database"
+      MYSQL_ROOT_PASSWORD: "ale_sql_pass"
+      MYSQL_PASSWORD: "ale_sql_pass"
+    ports:
+      - "3308:3306"
+    healthcheck:
+      test: "/usr/bin/mysql --user=root --password=ale_sql_pass --execute \"SHOW DATABASES;\""
+      interval: 5s
+      timeout: 2s
+      retries: 60
+
+  simulator:
+    build: ./microservices/simulator
+    container_name: ml_model_tracking_simulator
+    ports:
+      - "5000:5000"
+    links:
+      - db
+    depends_on:
+      db:
+        condition: service_healthy
+
+  ml:
+    build: ./microservices/ml
+    container_name: ml_model_tracking_ml
+    ports:
+      - "5001:5001"
+    links:
+      - db
+    depends_on:
+      db:
+        condition: service_healthy
+
+  tracking:
+    build: ./microservices/tracking
+    container_name: ml_model_tracking_tracking
+    ports:
+      - "5002:5002"
+    links:
+      - db
+      - mlflow_db
+    depends_on:
+      db:
+        condition: service_healthy
+      mlflow_db:
+        condition: service_healthy
+```
+
+
+## Emulating the Lifecycle
+
+The goal of this project is to emulate the entire lifecycle of an *ML model* in a *production environment*, from tracking
+model optimizations to selecting the best-performing model and comparing stored results. By logging and making these records
+easily accessible, it enables streamlined model selection and performance analysis. 
+Using [`Postman`](https://www.postman.com/), different requests can be sent to each *microservice* to manage and interact with each stage of this lifecycle.
+
+
+### MLFlow Logging
+
+First of all the **training set must be loaded** on the *MySQL DB dataset*, in order to train *ML model* and perform the
+hyperparameter tuning.
+
+#### Training Data Loading
+
+```
+POST request on http://127.0.0.1:5000/root/simulator
+Request body: {
+  "set_name": "training"
+}
+```
+
+#### Hyperparameter Tuning and Logging Expreiment
+
+We then send a **POST** request to initiate the model optimization specifying:
+- the models
+- hyperparameters
+- grid search instructions (cross-validation and scoring metric)
+- and logging details for experiment tracking in MLflow.
+
+```
+POST request on http://127.0.0.1:5002/root/tracking/model_management
+Request body: {
+  "request_information": "optimization",
+  "experiment_name": "wine_test_1",
+  "experiment_description": "Grid Search Optimization - Cross Validation Performance",
+  "experiment_owner": "Ale",
+
+  "models": ["LogisticRegression", "RandomForest", "SVC"],
+  "hyperparameters": {
+    "LogisticRegression": {
+      "C": [0.1, 1],
+      "solver": ["liblinear"]
+    },
+    "RandomForest": {
+      "n_estimators": [ 1, 3],
+      "max_depth": [null, 3],
+      "min_samples_split": [2, 5]
+    },
+    "SVC": {
+      "C": [0.1, 10],
+      "kernel": ["linear", "rbf"],
+      "gamma": ["scale", "auto"]
+    }
+  },
+
+  "scoring": "accuracy",
+  "cv": 5
+}
+```
+Response:
+```
+{
+    "message": "Experiments retrieved successfully",
+    "data": {
+        "experiment_id": "1",
+        "run_ids": {
+            "LogisticRegression": "5f69f7ee0507453e9787991521adeb82",
+            "RandomForest": "2d8371356f1f4665b7697d732f5da3f3",
+            "SVC": "0b9f23e1f0c046d39b39e4b0add4ac95"
+        }
+    }
+}
+```
+
+It is essential to save both the *experiment ID* and the *runs IDs*. However, in any case, they can still be retrieved through simple GET requests.
+
+### MLflow Data Recovery
+
+#### Recover all saved experiments with limited information:
+
+```
+GET request on http://127.0.0.1:5002/root/tracking/experiments
+```
+Response:
+```
+{
+    "message": "Experiments retrieved successfully",
+    "data": [
+        {
+            "experiment_id": "1",
+            "name": "wine_test",
+            "lifecycle_stage": "active",
+            "run_count": 3
+        }
+    ]
+}
+```
+#### Recovery all Runs of a specify Experiments througth Id
+```
+GET request on http://127.0.0.1:5002/root/tracking/runs?experiment_id=1
+```
+Response:
+```
+{
+    "message": "Experiment Runs Retrieved",
+    "data": [
+        {
+            "run_id": "0b9f23e1f0c046d39b39e4b0add4ac95",
+            "status": "FINISHED",
+            "start_time": "2024-10-30 20:44:21",
+            "end_time": "2024-10-30 20:44:22",
+            "run_name": "SVC Grid_Search_Opt and CV_Performance",
+            "tags": {
+                "model_type": "SVC",
+                "experiment_type": "GridSearch_CrossValidation"
+            }
+        },
+        {
+            "run_id": "2d8371356f1f4665b7697d732f5da3f3",
+            "status": "FINISHED",
+            "start_time": "2024-10-30 20:44:19",
+            "end_time": "2024-10-30 20:44:21",
+            "run_name": "RandomForest Grid_Search_Opt and CV_Performance",
+            "tags": {
+                "model_type": "RandomForest",
+                "experiment_type": "GridSearch_CrossValidation"
+            }
+        },
+        {
+            "run_id": "5f69f7ee0507453e9787991521adeb82",
+            "status": "FINISHED",
+            "start_time": "2024-10-30 20:44:16",
+            "end_time": "2024-10-30 20:44:19",
+            "run_name": "LogisticRegression Grid_Search_Opt and CV_Performance",
+            "tags": {
+                "model_type": "LogisticRegression",
+                "experiment_type": "GridSearch_CrossValidation"
+            }
+        }
+    ]
+}
+```
+
+#### Recover information about a specified *Experiment*:
+
+- The `request_information` can be:
+
+1. `general`: for obtaining general information about experiments.
+2. `best_model`: to get the runs related to the model that achieved the best performance during cross-validation. In this case, specifying the `filter` for the metric to consider is required.
+3. `statistics`: to obtain various statistics about metrics such as mean, median, standard deviation, variance, min, max, mode, and IQR. You can use `filter` to specify which metrics to consider; to get a complete report of statistics, set `filter` to 'all' or omit it.
+
+```
+POST request on http://127.0.0.1:5002/root/tracking/experiments
+{
+    "experiment_id": "1",
+    "request_information": "general"
+}
+```
+
+response:
+```
+{
+    "message": "Information Retrieved",
+    "data": {
+        "experiment_info": {
+            "experiment_id": "1",
+            "experiment_name": "wine_test",
+            "artifact_location": "/app/mlruns/1",
+            "lifecycle_stage": "active",
+            "tags": {
+                "description": "Grid Search Optimization - Cross Validation Performance",
+                "owner": "Ale"
+            },
+            "data_creation": "2024-10-30 20:44:16",
+            "last_updated": "2024-10-30 20:44:16"
+        },
+        "experiment_runs": {
+            "number_of_runs": 3,
+            "completed_runs": 3,
+            "failed_runs": 0,
+            "active_runs": 0,
+            "stopped_runs": 0,
+            "first_run_completed": "2024-10-30 20:44:16",
+            "last_run_completed": "2024-10-30 20:44:22"
+        }
+    }
+}
+```
+---
+```
+POST request on http://127.0.0.1:5002/root/tracking/experiments
+{
+    "experiment_id": "1",
+    "request_information": "best_model",
+    "filter": ["model_accuracy"]
+}
+```
+response:
+```
+{
+    "message": "Best model and run retrieved successfully.",
+    "data": {
+        "run_id": "5f69f7ee0507453e9787991521adeb82",
+        "run_name": "LogisticRegression Grid_Search_Opt and CV_Performance",
+        "model": "LogisticRegression",
+        "metrics": {
+            "model_accuracy": 0.9245283018867925
+        }
+    }
+}
+```
+---
+```
+POST request on http://127.0.0.1:5002/root/tracking/experiments
+{
+    "experiment_id": "1",
+    "request_information": "statistics",
+    "filter": ["all"]
+}
+```
+response:
+```
+{
+    "message": "Statistics Retrieved",
+    "data": {
+        "duration": {
+            "mean": 0.3225320180257161,
+            "median": 0.22951197624206543,
+            "std_dev": 0.24966742678439094,
+            "variance": 0.06233382399713921,
+            "min": 0.0740654468536377,
+            "max": 0.6640186309814453,
+            "mode": 0.6640186309814453,
+            "iqr": 0.5899531841278076
+        },
+        "accuracy": {
+            "mean": 0.9088050314465409,
+            "median": 0.9150943396226415,
+            "std_dev": 0.016034652558467873,
+            "variance": 0.0002571100826707803,
+            "min": 0.8867924528301887,
+            "max": 0.9245283018867925,
+            "mode": 0.9150943396226415,
+            "iqr": 0.037735849056603765
+        },
+        "f1_score": {
+            "mean": 0.9079266853127027,
+            "median": 0.9145840674968364,
+            "std_dev": 0.016324599192037065,
+            "variance": 0.0002664925387806572,
+            "min": 0.8854538500764916,
+            "max": 0.9237421383647799,
+            "mode": 0.9145840674968364,
+            "iqr": 0.03828828828828834
+        },
+        "precision": {
+            "mean": 0.9108102003255284,
+            "median": 0.9189476849854208,
+            "std_dev": 0.016590439513733773,
+            "variance": 0.0002752426832588589,
+            "min": 0.8876836503450208,
+            "max": 0.9257992656461439,
+            "mode": 0.9189476849854208,
+            "iqr": 0.03811561530112306
+        },
+        "recall": {
+            "mean": 0.9088050314465409,
+            "median": 0.9150943396226415,
+            "std_dev": 0.016034652558467873,
+            "variance": 0.0002571100826707803,
+            "min": 0.8867924528301887,
+            "max": 0.9245283018867925,
+            "mode": 0.9150943396226415,
+            "iqr": 0.037735849056603765
+        }
+    }
+}
+```
+#### Recover Information about a Specified *Run*
+
+To retrieve information about a specific *Run*, you need to provide the `run_id` in addition to the `experiment_id`. The `request_information` can be specified as follows:
+
+1. **`parameters`**: This retrieves the parameters defined by the `type` field, which can be:
+   - **`data`**: Use this to obtain parameters such as the number of data samples, features, and the different classes of data utilized during hyperparameter tuning.
+   - **`grid_search`**: Select this to get the scoring, cross-validation details, and all model parameters used in the grid search.
+   - **`model`**: Use this option to retrieve the parameters that were optimized during the model training process.
+
+```
+POST request on http://127.0.0.1:5002/root/tracking/runs
+{
+    "experiment_id": "1",
+    "run_id": "5f69f7ee0507453e9787991521adeb82",
+    "request_information": "parameters",
+    "type": "data"
+}
+```
+response:
+```
+{
+    "message": "Parameters Retrieved",
+    "data": {
+        "classes": "3",
+        "features": "13",
+        "samples": "106"
+    }
+}
+```
+---
+```
+POST request on http://127.0.0.1:5002/root/tracking/runs
+{
+    "experiment_id": "1",
+    "run_id": "5f69f7ee0507453e9787991521adeb82",
+    "request_information": "parameters",
+    "type": "grid_search"
+}
+```
+response:
+```
+{
+    "message": "Parameters Retrieved",
+    "data": {
+        "C": "[0.1, 1]",
+        "cv_folds": "5",
+        "scoring": "accuracy",
+        "solver": "['liblinear']"
+    }
+}
+```
+---
+```
+POST request on http://127.0.0.1:5002/root/tracking/runs
+{
+    "experiment_id": "1",
+    "run_id": "5f69f7ee0507453e9787991521adeb82",
+    "request_information": "parameters",
+    "type": "model"
+}
+```
+response:
+```
+{
+    "message": "Parameters Retrieved",
+    "data": {
+        "C": "0.1",
+        "solver": "liblinear"
+    }
+}
+```
+---
+
+2. **`metrics`**: This retrieves metrics defined by the `type` field, which can include:
+   - **`system`**: This option retrieves CPU usage data during the processing.
+   - **`model`**: This retrieves all metrics computed during cross-validation.
+
+```
+POST request on http://127.0.0.1:5002/root/tracking/runs
+{
+    "experiment_id": "1",
+    "run_id": "5f69f7ee0507453e9787991521adeb82",
+    "request_information": "metrics",
+    "type": "system"
+}
+```
+response:
+```
+{
+    "message": "Parameters Retrieved",
+    "data": {
+        "cpu_usage": 18.6,
+        "execution_time": 0.0740654468536377
+    }
+}
+```
+---
+```
+POST request on http://127.0.0.1:5002/root/tracking/runs
+
+{
+    "experiment_id": "1",
+    "run_id": "5f69f7ee0507453e9787991521adeb82",
+    "request_information": "metrics",
+    "type": "model"
+}
+```
+response:
+```
+{
+    "message": "Parameters Retrieved",
+    "data": {
+        "accuracy": 0.9245283018867925,
+        "f1_score": 0.9237421383647799,
+        "precision": 0.9257992656461439,
+        "recall": 0.9245283018867925
+    }
+}
+```
+### Setting and Use of Model
+
+
+#### Set Model for **ML** micro-service
+```
+POST request on http://127.0.0.1:5002/root/tracking/model_management
+{
+    "request_information":"setting",
+    "run_id":"5f69f7ee0507453e9787991521adeb82"
+}
+```
+
+#### Using Model in ML service
+
+Now, the *ML model* can be trained and tested.
+
+```
+POST request on http://127.0.0.1:5001/root/ml
+Request body: {
+  "dataset":"training"
+}
+```
+
+#### Testing
+
+First, we load the test data.
+
+```
+POST request on http://127.0.0.1:5000/root/simulator
+Request body: {
+  "set_name": "testing"
+}
+```
+Now, the *ML model* can be tested on the *testing* set.
+
+```
+POST request on http://127.0.0.1:5001/root/ml
+Request body: {
+  "dataset": "testing"
+}
+```
+
+### ML Model in a Production Environment
+
+Having a well performing *ML model*, it is feasible to put it in a *production environment*.
+It is now possible also load the *production* set, that is the final *batch* of dirty data. This data simulate the new and unseen data that come to the *ML model* once it is put in a *production environment*.
+```
+POST request on http://127.0.0.1:5000/root/simulator
+Request body: {
+  "set_name": "production"
+}
+```
+
+The *ML model* can be tested on the *production* set. Very often *production* data, over time, tend to differ from the data on which the *ML model* was trained, thus causing a decline in performance.
+```
+POST request on http://127.0.0.1:5001/root/ml
+Request body: {
+  "dataset": "production"
+}
+```
+
+### Deleting Experiments and Runs
+
+```
+DELETE request on http://127.0.0.1:5002/root/tracking/experiments?experiment_id=1
+```
+```
+DELETE request on http://127.0.0.1:5002/root/tracking/runs?experiment_id=1&run_id=5f69f7ee0507453e9787991521adeb82
+```
+
+## Future Integration
+
+There are many other (*open-source*) tools that can be very useful to be used in a *MLOps* pipeline:
+- [`Feast`](https://feast.dev/): a *feature* store used to store *raw data* to pass to the *ML model*;
+- [`Seldon Core`](https://github.com/SeldonIO/seldon-core): a tool that helps in the deployment of *ML model*;
+- [`Kubeflow`](https://www.kubeflow.org/): a platform to build the entire *infra-structure* to integrate and orchestrate all the different tools.
